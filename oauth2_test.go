@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -568,6 +570,215 @@ func TestRefreshToken_RefreshTokenPreservation(t *testing.T) {
 	}
 	if tk.RefreshToken != oldRefreshToken {
 		t.Errorf("RefreshToken = %q; want %q", tk.RefreshToken, oldRefreshToken)
+	}
+}
+
+func TestOnTokenChange_Called(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"access_token":"NEW_ACCESS","refresh_token":"NEW_REFRESH","token_type":"bearer","expires_in":3600}`))
+	}))
+	defer ts.Close()
+
+	var notifiedToken *Token
+	conf := newConf(ts.URL)
+	conf.OnTokenChange = func(tok *Token) {
+		notifiedToken = tok
+	}
+
+	// Use an expired token to force a refresh on first call.
+	tok := &Token{
+		AccessToken:  "OLD_ACCESS",
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(-time.Hour),
+	}
+	src := conf.TokenSource(context.Background(), tok)
+	newTok, err := src.Token()
+	if err != nil {
+		t.Fatalf("Token() = %v; want no error", err)
+	}
+	if newTok.AccessToken != "NEW_ACCESS" {
+		t.Errorf("AccessToken = %q; want %q", newTok.AccessToken, "NEW_ACCESS")
+	}
+	if notifiedToken == nil {
+		t.Fatal("OnTokenChange was not called")
+	}
+	if notifiedToken.AccessToken != "NEW_ACCESS" {
+		t.Errorf("notified AccessToken = %q; want %q", notifiedToken.AccessToken, "NEW_ACCESS")
+	}
+	if notifiedToken.RefreshToken != "NEW_REFRESH" {
+		t.Errorf("notified RefreshToken = %q; want %q", notifiedToken.RefreshToken, "NEW_REFRESH")
+	}
+}
+
+func TestOnTokenChange_NotCalledForCachedToken(t *testing.T) {
+	called := false
+	conf := &Config{
+		ClientID: "CLIENT_ID",
+		Endpoint: Endpoint{TokenURL: "http://unused"},
+		OnTokenChange: func(tok *Token) {
+			called = true
+		},
+	}
+
+	// Use a valid (non-expired) token — should be served from cache,
+	// no refresh, no notification.
+	tok := &Token{
+		AccessToken: "VALID_TOKEN",
+		Expiry:      time.Now().Add(time.Hour),
+	}
+	src := conf.TokenSource(context.Background(), tok)
+	_, err := src.Token()
+	if err != nil {
+		t.Fatalf("Token() = %v; want no error", err)
+	}
+	if called {
+		t.Error("OnTokenChange was called for a cached token; want no call")
+	}
+}
+
+func TestOnTokenChange_NilCallback(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"access_token":"NEW_ACCESS","refresh_token":"NEW_REFRESH","token_type":"bearer","expires_in":3600}`))
+	}))
+	defer ts.Close()
+
+	conf := newConf(ts.URL)
+	// OnTokenChange is nil (default) — should not panic.
+	tok := &Token{
+		AccessToken:  "OLD_ACCESS",
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(-time.Hour),
+	}
+	src := conf.TokenSource(context.Background(), tok)
+	_, err := src.Token()
+	if err != nil {
+		t.Fatalf("Token() = %v; want no error", err)
+	}
+}
+
+func TestOnTokenChange_CalledViaClient(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"access_token":"NEW_ACCESS","refresh_token":"NEW_REFRESH","token_type":"bearer","expires_in":3600}`))
+			return
+		}
+		// Echo back any other request.
+	}))
+	defer ts.Close()
+
+	var notifiedToken *Token
+	conf := newConf(ts.URL)
+	conf.OnTokenChange = func(tok *Token) {
+		notifiedToken = tok
+	}
+
+	tok := &Token{
+		RefreshToken: "OLD_REFRESH",
+	}
+	c := conf.Client(context.Background(), tok)
+	_, err := c.Get(ts.URL + "/resource")
+	if err != nil {
+		t.Fatalf("Get = %v; want no error", err)
+	}
+	if notifiedToken == nil {
+		t.Fatal("OnTokenChange was not called via Config.Client")
+	}
+	if notifiedToken.AccessToken != "NEW_ACCESS" {
+		t.Errorf("notified AccessToken = %q; want %q", notifiedToken.AccessToken, "NEW_ACCESS")
+	}
+}
+
+func TestOnTokenChange_Concurrent(t *testing.T) {
+	var refreshCount int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		n := atomic.AddInt32(&refreshCount, 1)
+		fmt.Fprintf(w, `{"access_token":"ACCESS_%d","refresh_token":"REFRESH_%d","token_type":"bearer","expires_in":3600}`, n, n)
+	}))
+	defer ts.Close()
+
+	var callCount int32
+	conf := newConf(ts.URL)
+	conf.OnTokenChange = func(tok *Token) {
+		atomic.AddInt32(&callCount, 1)
+	}
+
+	tok := &Token{
+		AccessToken:  "OLD_ACCESS",
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(-time.Hour),
+	}
+	src := conf.TokenSource(context.Background(), tok)
+
+	// Launch multiple goroutines all calling Token() concurrently
+	// on an expired token. The reuseTokenSource mutex ensures only
+	// one refresh happens; the callback should fire exactly once.
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer wg.Done()
+			_, err := src.Token()
+			if err != nil {
+				t.Errorf("Token() = %v; want no error", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&callCount); got != 1 {
+		t.Errorf("OnTokenChange called %d times; want 1", got)
+	}
+	if got := atomic.LoadInt32(&refreshCount); got != 1 {
+		t.Errorf("token endpoint hit %d times; want 1", got)
+	}
+}
+
+func TestOnTokenChange_CalledOnEachRefresh(t *testing.T) {
+	var refreshCount int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		n := atomic.AddInt32(&refreshCount, 1)
+		// Return a token that expires immediately so the next call triggers another refresh.
+		fmt.Fprintf(w, `{"access_token":"ACCESS_%d","refresh_token":"REFRESH_%d","token_type":"bearer","expires_in":1}`, n, n)
+	}))
+	defer ts.Close()
+
+	var callCount int32
+	conf := newConf(ts.URL)
+	conf.OnTokenChange = func(tok *Token) {
+		atomic.AddInt32(&callCount, 1)
+	}
+
+	tok := &Token{
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(-time.Hour),
+	}
+	src := conf.TokenSource(context.Background(), tok)
+
+	// First call: token is expired, triggers refresh #1.
+	_, err := src.Token()
+	if err != nil {
+		t.Fatalf("Token() #1 = %v; want no error", err)
+	}
+
+	// Force the cached token to be expired so the next call triggers refresh #2.
+	// We do this by manipulating timeNow.
+	saved := timeNow
+	timeNow = func() time.Time { return time.Now().Add(time.Hour) }
+	defer func() { timeNow = saved }()
+
+	_, err = src.Token()
+	if err != nil {
+		t.Fatalf("Token() #2 = %v; want no error", err)
+	}
+
+	if got := atomic.LoadInt32(&callCount); got != 2 {
+		t.Errorf("OnTokenChange called %d times; want 2", got)
 	}
 }
 

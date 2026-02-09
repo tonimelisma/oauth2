@@ -58,6 +58,17 @@ type Config struct {
 	// Scopes specifies optional requested permissions.
 	Scopes []string
 
+	// OnTokenChange is an optional callback that is invoked when a token
+	// refresh produces a new token. The callback is called synchronously
+	// but outside the token cache's mutex, after the new token has been
+	// cached in memory. The provided token must not be modified.
+	//
+	// This is typically used to persist refreshed tokens to durable
+	// storage (such as a database or file) so they survive process
+	// restarts. Without this callback, refreshed tokens exist only in
+	// memory and are lost when the process exits.
+	OnTokenChange func(newToken *Token)
+
 	// authStyleCache caches which auth style to use when Endpoint.AuthStyle is
 	// the zero value (AuthStyleAutoDetect).
 	authStyleCache internal.LazyAuthStyleCache
@@ -254,8 +265,9 @@ func (c *Config) TokenSource(ctx context.Context, t *Token) TokenSource {
 		tkr.refreshToken = t.RefreshToken
 	}
 	return &reuseTokenSource{
-		t:   t,
-		new: tkr,
+		t:      t,
+		new:    tkr,
+		notify: c.OnTokenChange,
 	}
 }
 
@@ -295,7 +307,8 @@ func (tf *tokenRefresher) Token() (*Token, error) {
 // Token. If it's expired, it will be auto-refreshed using the
 // new TokenSource.
 type reuseTokenSource struct {
-	new TokenSource // called when t is expired.
+	new    TokenSource // called when t is expired.
+	notify func(*Token)
 
 	mu sync.Mutex // guards t
 	t  *Token
@@ -307,16 +320,23 @@ type reuseTokenSource struct {
 // refresh the current token and return the new one.
 func (s *reuseTokenSource) Token() (*Token, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.t.Valid() {
-		return s.t, nil
+		t := s.t
+		s.mu.Unlock()
+		return t, nil
 	}
 	t, err := s.new.Token()
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
 	t.expiryDelta = s.expiryDelta
 	s.t = t
+	notify := s.notify
+	s.mu.Unlock()
+	if notify != nil {
+		notify(t)
+	}
 	return t, nil
 }
 

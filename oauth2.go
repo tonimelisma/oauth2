@@ -60,14 +60,22 @@ type Config struct {
 
 	// OnTokenChange is an optional callback that is invoked when a token
 	// refresh produces a new token. The callback is called synchronously
-	// but outside the token cache's mutex, after the new token has been
-	// cached in memory. The provided token must not be modified.
+	// after the new token has been cached in memory.
+	//
+	// Later refreshes from the same TokenSource wait for the callback to
+	// return, so the callback should return quickly. The callback is
+	// called outside the token cache's mutex and receives a copy of the
+	// newly cached token.
+	//
+	// The callback must not trigger another refresh through the same
+	// TokenSource or a Client derived from it. It is not called for
+	// initial token acquisition or failed refreshes.
 	//
 	// This is typically used to persist refreshed tokens to durable
 	// storage (such as a database or file) so they survive process
 	// restarts. Without this callback, refreshed tokens exist only in
 	// memory and are lost when the process exits.
-	OnTokenChange func(newToken *Token)
+	OnTokenChange func(token *Token)
 
 	// authStyleCache caches which auth style to use when Endpoint.AuthStyle is
 	// the zero value (AuthStyleAutoDetect).
@@ -264,11 +272,7 @@ func (c *Config) TokenSource(ctx context.Context, t *Token) TokenSource {
 	if t != nil {
 		tkr.refreshToken = t.RefreshToken
 	}
-	return &reuseTokenSource{
-		t:      t,
-		new:    tkr,
-		notify: c.OnTokenChange,
-	}
+	return newReuseTokenSource(t, tkr, c.OnTokenChange, 0)
 }
 
 // tokenRefresher is a TokenSource that makes "grant_type=refresh_token"
@@ -310,10 +314,33 @@ type reuseTokenSource struct {
 	new    TokenSource // called when t is expired.
 	notify func(*Token)
 
-	mu sync.Mutex // guards t
+	mu sync.Mutex // guards t and expiryDelta
 	t  *Token
 
+	refreshMu sync.Mutex // serializes refreshes and callback completion
+
 	expiryDelta time.Duration
+}
+
+func newReuseTokenSource(t *Token, src TokenSource, notify func(*Token), expiryDelta time.Duration) *reuseTokenSource {
+	if t != nil {
+		t.expiryDelta = expiryDelta
+	}
+	return &reuseTokenSource{
+		t:           t,
+		new:         src,
+		notify:      notify,
+		expiryDelta: expiryDelta,
+	}
+}
+
+func (s *reuseTokenSource) setExpiryDelta(expiryDelta time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.expiryDelta = expiryDelta
+	if s.t != nil {
+		s.t.expiryDelta = expiryDelta
+	}
 }
 
 // Token returns the current token if it's still valid, else will
@@ -325,17 +352,33 @@ func (s *reuseTokenSource) Token() (*Token, error) {
 		s.mu.Unlock()
 		return t, nil
 	}
+	s.mu.Unlock()
+
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+
+	s.mu.Lock()
+	if s.t.Valid() {
+		t := s.t
+		s.mu.Unlock()
+		return t, nil
+	}
+	s.mu.Unlock()
+
 	t, err := s.new.Token()
 	if err != nil {
-		s.mu.Unlock()
 		return nil, err
 	}
+
+	s.mu.Lock()
 	t.expiryDelta = s.expiryDelta
 	s.t = t
 	notify := s.notify
 	s.mu.Unlock()
+
 	if notify != nil {
-		notify(t)
+		notifyToken := cloneToken(t)
+		notify(notifyToken)
 	}
 	return t, nil
 }
@@ -407,12 +450,9 @@ func ReuseTokenSource(t *Token, src TokenSource) TokenSource {
 			// Just use it directly.
 			return rt
 		}
-		src = rt.new
+		return newReuseTokenSource(t, rt.new, rt.notify, rt.expiryDelta)
 	}
-	return &reuseTokenSource{
-		t:   t,
-		new: src,
-	}
+	return newReuseTokenSource(t, src, nil, 0)
 }
 
 // ReuseTokenSourceWithExpiry returns a [TokenSource] that acts in the same manner as the
@@ -427,17 +467,10 @@ func ReuseTokenSourceWithExpiry(t *Token, src TokenSource, earlyExpiry time.Dura
 		if t == nil {
 			// Just use it directly, but set the expiryDelta to earlyExpiry,
 			// so the behavior matches what the user expects.
-			rt.expiryDelta = earlyExpiry
+			rt.setExpiryDelta(earlyExpiry)
 			return rt
 		}
-		src = rt.new
+		return newReuseTokenSource(t, rt.new, rt.notify, earlyExpiry)
 	}
-	if t != nil {
-		t.expiryDelta = earlyExpiry
-	}
-	return &reuseTokenSource{
-		t:           t,
-		new:         src,
-		expiryDelta: earlyExpiry,
-	}
+	return newReuseTokenSource(t, src, nil, earlyExpiry)
 }

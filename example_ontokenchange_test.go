@@ -7,32 +7,48 @@ package oauth2_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"sync"
 
 	"golang.org/x/oauth2"
 )
 
-// saveToken saves the token to a file as JSON.
-func saveToken(tok *oauth2.Token) {
+var (
+	tokenFileMu sync.Mutex
+)
+
+// saveToken saves the latest token to a file as JSON.
+func saveToken(tok *oauth2.Token) error {
+	tokenFileMu.Lock()
+	defer tokenFileMu.Unlock()
+
 	data, err := json.Marshal(tok)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	if err := os.WriteFile("token.json", data, 0600); err != nil {
-		log.Fatal(err)
+		return err
 	}
+	return nil
 }
 
 // loadToken reads a previously saved token from a file.
 func loadToken() (*oauth2.Token, error) {
+	tokenFileMu.Lock()
+	defer tokenFileMu.Unlock()
+
 	data, err := os.ReadFile("token.json")
 	if err != nil {
 		return nil, err
 	}
 	tok := new(oauth2.Token)
-	return tok, json.Unmarshal(data, tok)
+	if err := json.Unmarshal(data, tok); err != nil {
+		return nil, err
+	}
+	return tok, nil
 }
 
 // doInitialOAuthFlow performs the initial authorization code exchange.
@@ -71,16 +87,24 @@ func ExampleConfig_onTokenChange() {
 			// Persist the entire *Token (access token, refresh
 			// token, expiry, etc.) to durable storage so it
 			// survives process restarts.
-			saveToken(tok)
+			if err := saveToken(tok); err != nil {
+				log.Printf("persisting refreshed token: %v", err)
+			}
 		},
 	}
 
 	// On startup, try to load a previously saved token.
 	tok, err := loadToken()
 	if err != nil {
-		// No saved token — run the initial OAuth flow to get one.
-		tok = doInitialOAuthFlow(ctx, conf)
-		saveToken(tok)
+		if errors.Is(err, os.ErrNotExist) {
+			// No saved token — run the initial OAuth flow to get one.
+			tok = doInitialOAuthFlow(ctx, conf)
+			if err := saveToken(tok); err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			log.Fatal(err)
+		}
 	}
 
 	// If the loaded access token is still valid, it is used directly
@@ -88,5 +112,9 @@ func ExampleConfig_onTokenChange() {
 	// refreshes it transparently and OnTokenChange persists the
 	// new token for next time.
 	client := conf.Client(ctx, tok)
-	client.Get("...")
+	resp, err := client.Get("...")
+	if err != nil {
+		log.Fatal(err)
+	}
+	resp.Body.Close()
 }

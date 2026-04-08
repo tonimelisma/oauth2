@@ -580,10 +580,10 @@ func TestOnTokenChange_Called(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	var notifiedToken *Token
+	var notified *Token
 	conf := newConf(ts.URL)
-	conf.OnTokenChange = func(tok *Token) {
-		notifiedToken = tok
+	conf.OnTokenChange = func(got *Token) {
+		notified = got
 	}
 
 	// Use an expired token to force a refresh on first call.
@@ -600,14 +600,14 @@ func TestOnTokenChange_Called(t *testing.T) {
 	if newTok.AccessToken != "NEW_ACCESS" {
 		t.Errorf("AccessToken = %q; want %q", newTok.AccessToken, "NEW_ACCESS")
 	}
-	if notifiedToken == nil {
+	if notified == nil {
 		t.Fatal("OnTokenChange was not called")
 	}
-	if notifiedToken.AccessToken != "NEW_ACCESS" {
-		t.Errorf("notified AccessToken = %q; want %q", notifiedToken.AccessToken, "NEW_ACCESS")
+	if notified.AccessToken != "NEW_ACCESS" {
+		t.Errorf("notified.AccessToken = %q; want %q", notified.AccessToken, "NEW_ACCESS")
 	}
-	if notifiedToken.RefreshToken != "NEW_REFRESH" {
-		t.Errorf("notified RefreshToken = %q; want %q", notifiedToken.RefreshToken, "NEW_REFRESH")
+	if notified.RefreshToken != "NEW_REFRESH" {
+		t.Errorf("notified.RefreshToken = %q; want %q", notified.RefreshToken, "NEW_REFRESH")
 	}
 }
 
@@ -616,7 +616,7 @@ func TestOnTokenChange_NotCalledForCachedToken(t *testing.T) {
 	conf := &Config{
 		ClientID: "CLIENT_ID",
 		Endpoint: Endpoint{TokenURL: "http://unused"},
-		OnTokenChange: func(tok *Token) {
+		OnTokenChange: func(token *Token) {
 			called = true
 		},
 	}
@@ -634,6 +634,33 @@ func TestOnTokenChange_NotCalledForCachedToken(t *testing.T) {
 	}
 	if called {
 		t.Error("OnTokenChange was called for a cached token; want no call")
+	}
+}
+
+func TestOnTokenChange_NotCalledOnRefreshError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer ts.Close()
+
+	var called int32
+	conf := newConf(ts.URL)
+	conf.OnTokenChange = func(token *Token) {
+		atomic.AddInt32(&called, 1)
+	}
+
+	src := conf.TokenSource(context.Background(), &Token{
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(-time.Hour),
+	})
+
+	if _, err := src.Token(); err == nil {
+		t.Fatal("Token() = nil error; want error")
+	}
+	if got := atomic.LoadInt32(&called); got != 0 {
+		t.Fatalf("OnTokenChange called %d times; want 0", got)
 	}
 }
 
@@ -671,8 +698,8 @@ func TestOnTokenChange_CalledViaClient(t *testing.T) {
 
 	var notifiedToken *Token
 	conf := newConf(ts.URL)
-	conf.OnTokenChange = func(tok *Token) {
-		notifiedToken = tok
+	conf.OnTokenChange = func(token *Token) {
+		notifiedToken = token
 	}
 
 	tok := &Token{
@@ -691,6 +718,107 @@ func TestOnTokenChange_CalledViaClient(t *testing.T) {
 	}
 }
 
+func TestOnTokenChange_RefreshTokenPreservedInCallback(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"access_token":"NEW_ACCESS","token_type":"bearer","expires_in":3600}`))
+	}))
+	defer ts.Close()
+
+	var notified *Token
+	conf := newConf(ts.URL)
+	conf.OnTokenChange = func(got *Token) {
+		notified = got
+	}
+
+	src := conf.TokenSource(context.Background(), &Token{
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(-time.Hour),
+	})
+
+	if _, err := src.Token(); err != nil {
+		t.Fatalf("Token() = %v; want no error", err)
+	}
+	if notified == nil {
+		t.Fatal("OnTokenChange was not called")
+	}
+	if got := notified.RefreshToken; got != "OLD_REFRESH" {
+		t.Fatalf("notified.RefreshToken = %q; want %q", got, "OLD_REFRESH")
+	}
+}
+
+func TestOnTokenChange_CalledViaReuseTokenSource(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"access_token":"NEW_ACCESS","refresh_token":"NEW_REFRESH","token_type":"bearer","expires_in":3600}`))
+	}))
+	defer ts.Close()
+
+	var notifiedToken *Token
+	conf := newConf(ts.URL)
+	conf.OnTokenChange = func(token *Token) {
+		notifiedToken = token
+	}
+
+	baseTok := &Token{
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(-time.Hour),
+	}
+	src := conf.TokenSource(context.Background(), baseTok)
+	src = ReuseTokenSource(&Token{
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(-time.Hour),
+	}, src)
+
+	_, err := src.Token()
+	if err != nil {
+		t.Fatalf("Token() = %v; want no error", err)
+	}
+	if notifiedToken == nil {
+		t.Fatal("OnTokenChange was not called via ReuseTokenSource")
+	}
+	if notifiedToken.AccessToken != "NEW_ACCESS" {
+		t.Errorf("notified AccessToken = %q; want %q", notifiedToken.AccessToken, "NEW_ACCESS")
+	}
+}
+
+func TestOnTokenChange_CalledViaReuseTokenSourceWithExpiry(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"access_token":"NEW_ACCESS","refresh_token":"NEW_REFRESH","token_type":"bearer","expires_in":3600}`))
+	}))
+	defer ts.Close()
+
+	var notifiedToken *Token
+	conf := newConf(ts.URL)
+	conf.OnTokenChange = func(token *Token) {
+		notifiedToken = token
+	}
+
+	baseTok := &Token{
+		AccessToken:  "OLD_ACCESS",
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(time.Second),
+	}
+	src := conf.TokenSource(context.Background(), baseTok)
+	src = ReuseTokenSourceWithExpiry(&Token{
+		AccessToken:  "OLD_ACCESS",
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(time.Second),
+	}, src, 2*time.Second)
+
+	_, err := src.Token()
+	if err != nil {
+		t.Fatalf("Token() = %v; want no error", err)
+	}
+	if notifiedToken == nil {
+		t.Fatal("OnTokenChange was not called via ReuseTokenSourceWithExpiry")
+	}
+	if notifiedToken.AccessToken != "NEW_ACCESS" {
+		t.Errorf("notified AccessToken = %q; want %q", notifiedToken.AccessToken, "NEW_ACCESS")
+	}
+}
+
 func TestOnTokenChange_Concurrent(t *testing.T) {
 	var refreshCount int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -702,7 +830,7 @@ func TestOnTokenChange_Concurrent(t *testing.T) {
 
 	var callCount int32
 	conf := newConf(ts.URL)
-	conf.OnTokenChange = func(tok *Token) {
+	conf.OnTokenChange = func(token *Token) {
 		atomic.AddInt32(&callCount, 1)
 	}
 
@@ -738,6 +866,127 @@ func TestOnTokenChange_Concurrent(t *testing.T) {
 	}
 }
 
+func TestOnTokenChange_BlockedCallbackDoesNotBlockCachedTokenCallers(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"access_token":"NEW_ACCESS","refresh_token":"NEW_REFRESH","token_type":"bearer","expires_in":3600}`))
+	}))
+	defer ts.Close()
+
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+
+	conf := newConf(ts.URL)
+	conf.OnTokenChange = func(token *Token) {
+		close(callbackStarted)
+		<-releaseCallback
+	}
+
+	src := conf.TokenSource(context.Background(), &Token{
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(-time.Hour),
+	})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := src.Token()
+		firstDone <- err
+	}()
+
+	<-callbackStarted
+
+	secondDone := make(chan *Token, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		tok, err := src.Token()
+		secondDone <- tok
+		secondErr <- err
+	}()
+
+	select {
+	case err := <-secondErr:
+		if err != nil {
+			t.Fatalf("Token() while callback blocked = %v; want no error", err)
+		}
+		tok := <-secondDone
+		if tok == nil || tok.AccessToken != "NEW_ACCESS" {
+			t.Fatalf("Token() while callback blocked = %#v; want NEW_ACCESS", tok)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cached Token() call blocked on OnTokenChange callback")
+	}
+
+	close(releaseCallback)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("initial Token() = %v; want no error", err)
+	}
+}
+
+func TestOnTokenChange_BlockedCallbackBlocksLaterRefreshes(t *testing.T) {
+	var refreshCount int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		n := atomic.AddInt32(&refreshCount, 1)
+		// expires_in=1 is within the default expiry skew, so each returned
+		// token is immediately treated as expired and the next call refreshes again.
+		fmt.Fprintf(w, `{"access_token":"ACCESS_%d","refresh_token":"REFRESH_%d","token_type":"bearer","expires_in":1}`, n, n)
+	}))
+	defer ts.Close()
+
+	firstCallbackStarted := make(chan struct{})
+	releaseFirstCallback := make(chan struct{})
+	var callbackCount int32
+
+	conf := newConf(ts.URL)
+	conf.OnTokenChange = func(token *Token) {
+		if atomic.AddInt32(&callbackCount, 1) == 1 {
+			close(firstCallbackStarted)
+			<-releaseFirstCallback
+		}
+	}
+
+	src := conf.TokenSource(context.Background(), &Token{
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(-time.Hour),
+	})
+
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := src.Token()
+		firstErr <- err
+	}()
+
+	<-firstCallbackStarted
+
+	secondErr := make(chan error, 1)
+	go func() {
+		_, err := src.Token()
+		secondErr <- err
+	}()
+
+	select {
+	case err := <-secondErr:
+		t.Fatalf("second Token() completed while first callback was blocked: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseFirstCallback)
+
+	if err := <-firstErr; err != nil {
+		t.Fatalf("Token() #1 = %v; want no error", err)
+	}
+	if err := <-secondErr; err != nil {
+		t.Fatalf("Token() #2 = %v; want no error", err)
+	}
+
+	if got := atomic.LoadInt32(&refreshCount); got != 2 {
+		t.Fatalf("token endpoint hit %d times; want 2", got)
+	}
+	if got := atomic.LoadInt32(&callbackCount); got != 2 {
+		t.Fatalf("OnTokenChange called %d times; want 2", got)
+	}
+}
+
 func TestOnTokenChange_CalledOnEachRefresh(t *testing.T) {
 	var refreshCount int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -748,10 +997,10 @@ func TestOnTokenChange_CalledOnEachRefresh(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	var callCount int32
+	var accessTokens []string
 	conf := newConf(ts.URL)
-	conf.OnTokenChange = func(tok *Token) {
-		atomic.AddInt32(&callCount, 1)
+	conf.OnTokenChange = func(token *Token) {
+		accessTokens = append(accessTokens, token.AccessToken)
 	}
 
 	tok := &Token{
@@ -777,8 +1026,50 @@ func TestOnTokenChange_CalledOnEachRefresh(t *testing.T) {
 		t.Fatalf("Token() #2 = %v; want no error", err)
 	}
 
-	if got := atomic.LoadInt32(&callCount); got != 2 {
-		t.Errorf("OnTokenChange called %d times; want 2", got)
+	if len(accessTokens) != 2 {
+		t.Fatalf("OnTokenChange called %d times; want 2", len(accessTokens))
+	}
+	if accessTokens[0] != "ACCESS_1" || accessTokens[1] != "ACCESS_2" {
+		t.Fatalf("OnTokenChange tokens = %v; want [ACCESS_1 ACCESS_2]", accessTokens)
+	}
+}
+
+func TestOnTokenChange_CallbackReceivesCopies(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"access_token":"NEW_ACCESS","refresh_token":"NEW_REFRESH","token_type":"bearer","expires_in":3600}`))
+	}))
+	defer ts.Close()
+
+	conf := newConf(ts.URL)
+	conf.OnTokenChange = func(token *Token) {
+		token.AccessToken = "MUTATED_NEW"
+		token.RefreshToken = "MUTATED_REFRESH"
+	}
+
+	src := conf.TokenSource(context.Background(), &Token{
+		AccessToken:  "OLD_ACCESS",
+		RefreshToken: "OLD_REFRESH",
+		Expiry:       time.Now().Add(-time.Hour),
+	})
+
+	tok, err := src.Token()
+	if err != nil {
+		t.Fatalf("Token() = %v; want no error", err)
+	}
+	if tok.AccessToken != "NEW_ACCESS" {
+		t.Fatalf("AccessToken = %q; want %q", tok.AccessToken, "NEW_ACCESS")
+	}
+	if tok.RefreshToken != "NEW_REFRESH" {
+		t.Fatalf("RefreshToken = %q; want %q", tok.RefreshToken, "NEW_REFRESH")
+	}
+
+	tok, err = src.Token()
+	if err != nil {
+		t.Fatalf("Token() cached = %v; want no error", err)
+	}
+	if tok.AccessToken != "NEW_ACCESS" {
+		t.Fatalf("cached AccessToken = %q; want %q", tok.AccessToken, "NEW_ACCESS")
 	}
 }
 

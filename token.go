@@ -66,6 +66,15 @@ type Token struct {
 	expiryDelta time.Duration
 }
 
+func cloneToken(t *Token) *Token {
+	if t == nil {
+		return nil
+	}
+	t2 := new(Token)
+	*t2 = *t
+	return t2
+}
+
 // Type returns t.TokenType if non-empty, else "Bearer".
 func (t *Token) Type() string {
 	if strings.EqualFold(t.TokenType, "bearer") {
